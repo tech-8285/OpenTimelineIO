@@ -2303,6 +2303,783 @@ main(int argc, char** argv)
         assert(error_status.outcome == OTIO_NS::ErrorStatus::TYPE_MISMATCH);
     });
 
+    // Overwrite that spans multiple clips with a gap in between.  The
+    // surviving left and right pieces must keep their original source ranges
+    // (only trimmed), the gap must be consumed, and the track duration must
+    // not change (overwrite semantics).
+    tests.add_test(
+        "test_edit_overwrite_across_multiple_clips_and_gap",
+        [] {
+            // Track layout (track time):
+            //   clip_a [0,24) source (0,24)
+            //   gap    [24,36)
+            //   clip_b [36,60) source (100,24)
+            SerializableObject::Retainer<Clip> clip_a = new Clip(
+                "clip_a",
+                nullptr,
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(24.0, 24.0)));
+            SerializableObject::Retainer<Gap> gap = new Gap(
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(12.0, 24.0)),
+                "gap");
+            SerializableObject::Retainer<Clip> clip_b = new Clip(
+                "clip_b",
+                nullptr,
+                TimeRange(
+                    RationalTime(100.0, 24.0),
+                    RationalTime(24.0, 24.0)));
+            SerializableObject::Retainer<Track> track = new Track();
+            track->append_child(clip_a);
+            track->append_child(gap);
+            track->append_child(clip_b);
+
+            const RationalTime duration = track->duration();
+            assertEqual(duration, RationalTime(60.0, 24.0));
+
+            // Overwrite [18,48): tail of clip_a, the whole gap, and the head
+            // of clip_b.
+            SerializableObject::Retainer<Clip> over = new Clip(
+                "over",
+                nullptr,
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(30.0, 24.0)));
+            OTIO_NS::ErrorStatus error_status;
+            algo::overwrite(
+                over,
+                track,
+                TimeRange(RationalTime(18.0, 24.0), RationalTime(30.0, 24.0)),
+                true,
+                nullptr,
+                &error_status);
+
+            assert(!is_error(error_status));
+            // Overwrite never changes the total duration.
+            assertEqual(track->duration(), duration);
+            // The gap was fully overwritten and removed: only the two
+            // surviving pieces plus the new clip remain.
+            assertEqual(track->children().size(), 3);
+            assert(!dynamic_retainer_cast<Gap>(track->children()[0]));
+            assert(!dynamic_retainer_cast<Gap>(track->children()[1]));
+            assert(!dynamic_retainer_cast<Gap>(track->children()[2]));
+
+            // Track (parent) ranges: left piece, new clip, right piece.
+            assert_track_ranges(
+                track,
+                { TimeRange(RationalTime(0.0, 24.0), RationalTime(18.0, 24.0)),
+                  TimeRange(RationalTime(18.0, 24.0), RationalTime(30.0, 24.0)),
+                  TimeRange(
+                      RationalTime(48.0, 24.0),
+                      RationalTime(12.0, 24.0)) });
+
+            // Source (trimmed) ranges: the left piece keeps clip_a's original
+            // source start, the right piece keeps clip_b's original source
+            // start offset by the 12 frames that were overwritten
+            // (100 + 12 == 112).
+            assert_clip_ranges(
+                track,
+                { TimeRange(RationalTime(0.0, 24.0), RationalTime(18.0, 24.0)),
+                  TimeRange(RationalTime(0.0, 24.0), RationalTime(30.0, 24.0)),
+                  TimeRange(
+                      RationalTime(112.0, 24.0),
+                      RationalTime(12.0, 24.0)) });
+
+            // Ownership: the new clip belongs to this track, the consumed gap
+            // no longer has a parent.
+            assert(over->parent() == track.value);
+            assert(gap->parent() == nullptr);
+            assert(dynamic_cast<Clip*>(track->children()[1].value)->name()
+                   == "over");
+        });
+
+    // An overwrite that replaces a clip with another clip of the exact same
+    // duration must still produce a distinguishable result: track duration is
+    // unchanged but the content (identity, name, source range) is different.
+    tests.add_test(
+        "test_edit_overwrite_same_duration_replaced_content",
+        [] {
+            SerializableObject::Retainer<Clip> clip_a = new Clip(
+                "clip_a",
+                nullptr,
+                TimeRange(RationalTime(5.0, 24.0), RationalTime(24.0, 24.0)));
+            SerializableObject::Retainer<Track> track = new Track();
+            track->append_child(clip_a);
+
+            SerializableObject::Retainer<Clip> clip_c = new Clip(
+                "clip_c",
+                nullptr,
+                TimeRange(
+                    RationalTime(50.0, 24.0),
+                    RationalTime(24.0, 24.0)));
+            OTIO_NS::ErrorStatus error_status;
+            algo::overwrite(
+                clip_c,
+                track,
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(24.0, 24.0)),
+                true,
+                nullptr,
+                &error_status);
+
+            assert(!is_error(error_status));
+            // Same total duration ...
+            assertEqual(track->duration(), RationalTime(24.0, 24.0));
+            // ... but the content was fully replaced, so the result is
+            // distinguishable by identity, name and source range.
+            assertEqual(track->children().size(), 1);
+            Clip* only_clip =
+                dynamic_cast<Clip*>(track->children()[0].value);
+            assertNotNull(only_clip);
+            assertEqual(only_clip->name(), std::string("clip_c"));
+            assert(only_clip == clip_c.value);
+            assertEqual(
+                only_clip->trimmed_range(),
+                TimeRange(
+                    RationalTime(50.0, 24.0),
+                    RationalTime(24.0, 24.0)));
+            // The replaced clip was detached from the track.
+            assert(clip_a->parent() == nullptr);
+        });
+
+    // Overwrite next to a transition: the remove_transitions option controls
+    // whether the transition is removed (true) or preserved (false), and both
+    // modes stay compatible with boundary edits.
+    tests.add_test(
+        "test_edit_overwrite_adjacent_to_transition",
+        [] {
+            auto build_track = [](SerializableObject::Retainer<Track>& track,
+                                  SerializableObject::Retainer<Transition>& trx) {
+                SerializableObject::Retainer<Clip> clip_0 = new Clip(
+                    "clip_0",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(24.0, 24.0)));
+                trx = new Transition(
+                    "transition_0",
+                    Transition::Type::SMPTE_Dissolve,
+                    RationalTime(5.0, 24.0),
+                    RationalTime(3.0, 24.0));
+                SerializableObject::Retainer<Clip> clip_1 = new Clip(
+                    "clip_1",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(24.0, 24.0)));
+                track = new Track();
+                track->append_child(clip_0);
+                track->append_child(trx);
+                track->append_child(clip_1);
+            };
+
+            // Branch 1: remove_transitions == true -> the transition is
+            // deleted, clips are overwritten normally.
+            {
+                SerializableObject::Retainer<Track>      track;
+                SerializableObject::Retainer<Transition> trx;
+                build_track(track, trx);
+
+                const TimeRange trx_range =
+                    track->trimmed_range_of_child(trx).value();
+
+                SerializableObject::Retainer<Clip> over = new Clip(
+                    "over",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        trx_range.duration()));
+                OTIO_NS::ErrorStatus error_status;
+                algo::overwrite(
+                    over,
+                    track,
+                    trx_range,
+                    true,
+                    nullptr,
+                    &error_status);
+
+                assert(!is_error(error_status));
+                size_t transition_count = 0;
+                for (const auto& child: track->children())
+                {
+                    if (dynamic_retainer_cast<Transition>(child))
+                        ++transition_count;
+                }
+                assertEqual(transition_count, static_cast<size_t>(0));
+                assert(trx->parent() == nullptr);
+                // The overlap region represented by the transition is
+                // replaced by a plain clip, so the track shrinks by the
+                // transition duration (48 -> 30).
+                assertEqual(track->duration(), RationalTime(30.0, 24.0));
+                assert_track_ranges(
+                    track,
+                    { TimeRange(
+                          RationalTime(0.0, 24.0), RationalTime(19.0, 24.0)),
+                      TimeRange(
+                          RationalTime(19.0, 24.0), RationalTime(8.0, 24.0)),
+                      TimeRange(
+                          RationalTime(27.0, 24.0), RationalTime(3.0, 24.0)) });
+            }
+
+            // Branch 2: remove_transitions == false -> the transition is
+            // preserved on the track.
+            {
+                SerializableObject::Retainer<Track>      track;
+                SerializableObject::Retainer<Transition> trx;
+                build_track(track, trx);
+
+                const TimeRange trx_range =
+                    track->trimmed_range_of_child(trx).value();
+
+                SerializableObject::Retainer<Clip> over = new Clip(
+                    "over",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        trx_range.duration()));
+                OTIO_NS::ErrorStatus error_status;
+                algo::overwrite(
+                    over,
+                    track,
+                    trx_range,
+                    false,
+                    nullptr,
+                    &error_status);
+
+                assert(!is_error(error_status));
+                size_t transition_count = 0;
+                for (const auto& child: track->children())
+                {
+                    if (dynamic_retainer_cast<Transition>(child))
+                        ++transition_count;
+                }
+                assertEqual(transition_count, static_cast<size_t>(1));
+                assert(trx->parent() == track.value);
+                // Same geometry as the removing branch, but the transition
+                // survives: four children instead of three, same total
+                // duration.  assert_track_ranges() skips transitions, so the
+                // transition's range is checked explicitly.
+                assertEqual(track->children().size(), 4);
+                assertEqual(track->duration(), RationalTime(30.0, 24.0));
+                assertEqual(
+                    track->trimmed_range_of_child(trx).value(),
+                    TimeRange(
+                        RationalTime(22.0, 24.0), RationalTime(8.0, 24.0)));
+                assert_track_ranges(
+                    track,
+                    { TimeRange(
+                          RationalTime(0.0, 24.0), RationalTime(19.0, 24.0)),
+                      TimeRange(
+                          RationalTime(19.0, 24.0), RationalTime(8.0, 24.0)),
+                      TimeRange(
+                          RationalTime(27.0, 24.0), RationalTime(3.0, 24.0)) });
+            }
+        });
+
+    // Insert pushes every downstream item (including across a gap) to the
+    // right by the inserted duration, grows the track by that duration, and
+    // leaves the downstream clip's own source range untouched.
+    tests.add_test(
+        "test_edit_insert_displaces_downstream_across_gap",
+        [] {
+            // clip_a [0,24), gap [24,36), clip_b [36,60) source (100,24)
+            SerializableObject::Retainer<Clip> clip_a = new Clip(
+                "clip_a",
+                nullptr,
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(24.0, 24.0)));
+            SerializableObject::Retainer<Gap> gap = new Gap(
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(12.0, 24.0)),
+                "gap");
+            SerializableObject::Retainer<Clip> clip_b = new Clip(
+                "clip_b",
+                nullptr,
+                TimeRange(
+                    RationalTime(100.0, 24.0),
+                    RationalTime(24.0, 24.0)));
+            SerializableObject::Retainer<Track> track = new Track();
+            track->append_child(clip_a);
+            track->append_child(gap);
+            track->append_child(clip_b);
+
+            // Insert a 10-frame clip 6 frames into clip_a.
+            SerializableObject::Retainer<Clip> insert_clip = new Clip(
+                "insert_clip",
+                nullptr,
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(10.0, 24.0)));
+            OTIO_NS::ErrorStatus error_status;
+            algo::insert(
+                insert_clip,
+                track,
+                RationalTime(6.0, 24.0),
+                true,
+                nullptr,
+                &error_status);
+
+            assert(!is_error(error_status));
+            // Insert grows the track by exactly the inserted duration.
+            assertEqual(track->duration(), RationalTime(70.0, 24.0));
+            assertEqual(track->children().size(), 5);
+
+            // clip_b moved from 36 to 46 (displaced by 10), but its source
+            // range is unchanged.
+            const TimeRange clip_b_parent =
+                clip_b->trimmed_range_in_parent().value();
+            assertEqual(
+                clip_b_parent,
+                TimeRange(RationalTime(46.0, 24.0), RationalTime(24.0, 24.0)));
+            assertEqual(
+                clip_b->trimmed_range(),
+                TimeRange(
+                    RationalTime(100.0, 24.0),
+                    RationalTime(24.0, 24.0)));
+
+            assert_track_ranges(
+                track,
+                { TimeRange(RationalTime(0.0, 24.0), RationalTime(6.0, 24.0)),
+                  TimeRange(RationalTime(6.0, 24.0), RationalTime(10.0, 24.0)),
+                  TimeRange(RationalTime(16.0, 24.0), RationalTime(18.0, 24.0)),
+                  TimeRange(RationalTime(34.0, 24.0), RationalTime(12.0, 24.0)),
+                  TimeRange(
+                      RationalTime(46.0, 24.0),
+                      RationalTime(24.0, 24.0)) });
+
+            // Inserting past the end fills the empty time with a gap and
+            // appends the clip: total duration stretches to 85.
+            SerializableObject::Retainer<Clip> tail = new Clip(
+                "tail",
+                nullptr,
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(5.0, 24.0)));
+            algo::insert(
+                tail,
+                track,
+                RationalTime(80.0, 24.0),
+                true,
+                nullptr,
+                &error_status);
+            assert(!is_error(error_status));
+            assertEqual(track->duration(), RationalTime(85.0, 24.0));
+            assertEqual(track->children().size(), 7);
+            assert(
+                dynamic_retainer_cast<Gap>(track->children()[5]) != nullptr);
+            assertEqual(
+                tail->trimmed_range_in_parent().value(),
+                TimeRange(RationalTime(80.0, 24.0), RationalTime(5.0, 24.0)));
+        });
+
+    // Ripple adjusts one clip and displaces everything downstream; when the
+    // clip does not have enough media handles, the requested delta is clamped
+    // to the media's available range and the downstream displacement / total
+    // duration reflect the clamped value rather than the requested one.
+    tests.add_test(
+        "test_edit_ripple_clamps_to_available_media",
+        [] {
+            SerializableObject::Retainer<MediaReference> media =
+                new MediaReference(
+                    "media_b",
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(40.0, 24.0)));
+            SerializableObject::Retainer<Gap> gap = new Gap(
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(20.0, 24.0)),
+                "gap");
+            SerializableObject::Retainer<Clip> clip_b = new Clip(
+                "clip_b",
+                media,
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(20.0, 24.0)));
+            SerializableObject::Retainer<Clip> clip_c = new Clip(
+                "clip_c",
+                nullptr,
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(20.0, 24.0)));
+            SerializableObject::Retainer<Track> track = new Track();
+            track->append_child(gap);
+            track->append_child(clip_b);
+            track->append_child(clip_c);
+            assertEqual(track->duration(), RationalTime(60.0, 24.0));
+
+            // Ask for +30 frames of handle on the out side, but only 20
+            // (40 available - 20 in use) exist: the edit is clamped.
+            OTIO_NS::ErrorStatus error_status;
+            algo::ripple(
+                clip_b,
+                RationalTime(0.0, 24.0),
+                RationalTime(30.0, 24.0),
+                &error_status);
+
+            assert(!is_error(error_status));
+            // clip_b grew by only 20 frames ...
+            assertEqual(
+                clip_b->trimmed_range(),
+                TimeRange(RationalTime(0.0, 24.0), RationalTime(40.0, 24.0)));
+            // ... clip_c was displaced by the same clamped 20 frames, and the
+            // whole track grew by 20 rather than the requested 30.
+            assertEqual(
+                clip_c->trimmed_range_in_parent().value(),
+                TimeRange(RationalTime(60.0, 24.0), RationalTime(20.0, 24.0)));
+            assertEqual(track->duration(), RationalTime(80.0, 24.0));
+
+            // In-side clamp: asking to move the source start past the end of
+            // the clip clamps to keep a non-empty, in-range source range.
+            SerializableObject::Retainer<MediaReference> media_2 =
+                new MediaReference(
+                    "media_b2",
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(60.0, 24.0)));
+            SerializableObject::Retainer<Clip> clip_d = new Clip(
+                "clip_d",
+                media_2,
+                TimeRange(
+                    RationalTime(10.0, 24.0),
+                    RationalTime(20.0, 24.0)));
+            SerializableObject::Retainer<Track> track_2 = new Track();
+            track_2->append_child(clip_d);
+            algo::ripple(
+                clip_d,
+                RationalTime(25.0, 24.0),
+                RationalTime(0.0, 24.0),
+                &error_status);
+            assert(!is_error(error_status));
+            // in_offset clamped from +25 to -5: source start 10 -> 5,
+            // end time unchanged.
+            assertEqual(
+                clip_d->trimmed_range(),
+                TimeRange(RationalTime(5.0, 24.0), RationalTime(25.0, 24.0)));
+        });
+
+    // When an overwrite fails mid-edit (here the deep copy of a tail piece
+    // fails), the error status must be surfaced AND the partial state left
+    // behind must be observable: this is neither a full success nor a clean
+    // rejection.  The same scenario without the failure completes fully and
+    // serves as the contrast.
+    tests.add_test(
+        "test_edit_overwrite_failure_leaves_partial_state",
+        [] {
+            // Failing run: both clips carry a cyclic metadata reference that
+            // makes clone() fail with TYPE_MISMATCH.
+            {
+                SerializableObject::Retainer<Clip> big_clip = new Clip(
+                    "big_clip",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(24.0, 24.0)));
+                big_clip->metadata()["cycle"] = big_clip;
+                SerializableObject::Retainer<Clip> small_clip = new Clip(
+                    "small_clip",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(5.0, 24.0)));
+                small_clip->metadata()["cycle"] = small_clip;
+
+                SerializableObject::Retainer<Track> track = new Track();
+                track->append_child(big_clip);
+
+                OTIO_NS::ErrorStatus error_status;
+                algo::overwrite(
+                    small_clip,
+                    track,
+                    TimeRange(
+                        RationalTime(12.0, 24.0),
+                        RationalTime(5.0, 24.0)),
+                    true,
+                    nullptr,
+                    &error_status);
+
+                // Error status is reported ...
+                assert(is_error(error_status));
+                assert(
+                    error_status.outcome
+                    == OTIO_NS::ErrorStatus::TYPE_MISMATCH);
+                // ... but partial modifications remain on the timeline:
+                // big_clip was already trimmed and small_clip already
+                // inserted, while the cloned tail piece never materialized.
+                assertEqual(track->children().size(), 2);
+                assertEqual(
+                    big_clip->trimmed_range(),
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(12.0, 24.0)));
+                assert(small_clip->parent() == track.value);
+                assertEqual(
+                    small_clip->trimmed_range(),
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(5.0, 24.0)));
+                assertEqual(
+                    track->duration(), RationalTime(17.0, 24.0));
+            }
+
+            // Contrast: identical geometry without cyclic metadata completes
+            // fully (left piece, new clip, cloned right piece).
+            {
+                SerializableObject::Retainer<Clip> big_clip = new Clip(
+                    "big_clip",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(24.0, 24.0)));
+                SerializableObject::Retainer<Clip> small_clip = new Clip(
+                    "small_clip",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(5.0, 24.0)));
+                SerializableObject::Retainer<Track> track = new Track();
+                track->append_child(big_clip);
+
+                OTIO_NS::ErrorStatus error_status;
+                algo::overwrite(
+                    small_clip,
+                    track,
+                    TimeRange(
+                        RationalTime(12.0, 24.0),
+                        RationalTime(5.0, 24.0)),
+                    true,
+                    nullptr,
+                    &error_status);
+
+                assert(!is_error(error_status));
+                assertEqual(track->children().size(), 3);
+                assertEqual(
+                    track->duration(), RationalTime(24.0, 24.0));
+            }
+        });
+
+    // Same mid-edit failure contract for insert: the split and insertion
+    // already happened when the tail clone fails, so partial state must be
+    // distinguishable from both full success and a rejected edit.
+    tests.add_test(
+        "test_edit_insert_failure_leaves_partial_state",
+        [] {
+            {
+                SerializableObject::Retainer<Clip> big_clip = new Clip(
+                    "big_clip",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(24.0, 24.0)));
+                big_clip->metadata()["cycle"] = big_clip;
+                SerializableObject::Retainer<Clip> small_clip = new Clip(
+                    "small_clip",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(5.0, 24.0)));
+                small_clip->metadata()["cycle"] = small_clip;
+
+                SerializableObject::Retainer<Track> track = new Track();
+                track->append_child(big_clip);
+
+                OTIO_NS::ErrorStatus error_status;
+                algo::insert(
+                    small_clip,
+                    track,
+                    RationalTime(12.0, 24.0),
+                    true,
+                    nullptr,
+                    &error_status);
+
+                assert(is_error(error_status));
+                assert(
+                    error_status.outcome
+                    == OTIO_NS::ErrorStatus::TYPE_MISMATCH);
+                // Partial residue: trimmed head + inserted clip, no cloned
+                // tail.
+                assertEqual(track->children().size(), 2);
+                assertEqual(
+                    big_clip->trimmed_range(),
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(12.0, 24.0)));
+                assert(small_clip->parent() == track.value);
+                assertEqual(
+                    track->duration(), RationalTime(17.0, 24.0));
+            }
+
+            // Full-success contrast.
+            {
+                SerializableObject::Retainer<Clip> big_clip = new Clip(
+                    "big_clip",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(24.0, 24.0)));
+                SerializableObject::Retainer<Clip> small_clip = new Clip(
+                    "small_clip",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(5.0, 24.0)));
+                SerializableObject::Retainer<Track> track = new Track();
+                track->append_child(big_clip);
+
+                OTIO_NS::ErrorStatus error_status;
+                algo::insert(
+                    small_clip,
+                    track,
+                    RationalTime(12.0, 24.0),
+                    true,
+                    nullptr,
+                    &error_status);
+
+                assert(!is_error(error_status));
+                assertEqual(track->children().size(), 3);
+                assertEqual(
+                    track->duration(), RationalTime(29.0, 24.0));
+            }
+        });
+
+    // A fill whose clone fails before any mutation must be a clean
+    // rejection: the error is reported and the timeline is byte-for-byte
+    // untouched (gap and both clips remain, the new clip is never parented).
+    tests.add_test("test_edit_fill_failure_is_clean_rejection", [] {
+        SerializableObject::Retainer<Clip> small_clip = new Clip(
+            "small_clip",
+            nullptr,
+            TimeRange(RationalTime(0.0, 24.0), RationalTime(5.0, 24.0)));
+        SerializableObject::Retainer<Gap> gap = new Gap(
+            TimeRange(RationalTime(0.0, 24.0), RationalTime(20.0, 24.0)),
+            "gap");
+        SerializableObject::Retainer<Clip> small_clip2 = new Clip(
+            "small_clip2",
+            nullptr,
+            TimeRange(RationalTime(0.0, 24.0), RationalTime(5.0, 24.0)));
+        SerializableObject::Retainer<Clip> big_clip = new Clip(
+            "big_clip",
+            nullptr,
+            TimeRange(RationalTime(0.0, 24.0), RationalTime(24.0, 24.0)));
+        big_clip->metadata()["cycle"] = big_clip;
+
+        SerializableObject::Retainer<Track> track = new Track();
+        track->append_child(small_clip);
+        track->append_child(gap);
+        track->append_child(small_clip2);
+        const RationalTime duration = track->duration();
+
+        OTIO_NS::ErrorStatus error_status;
+        algo::fill(
+            big_clip,
+            track,
+            RationalTime(12.0, 24.0),
+            ReferencePoint::Sequence,
+            &error_status);
+
+        assert(is_error(error_status));
+        assert(
+            error_status.outcome == OTIO_NS::ErrorStatus::TYPE_MISMATCH);
+        // Clean rejection: nothing was inserted, trimmed or removed.
+        assertEqual(track->children().size(), 3);
+        assert(track->children()[1].value == gap.value);
+        assertEqual(
+            gap->trimmed_range(),
+            TimeRange(RationalTime(0.0, 24.0), RationalTime(20.0, 24.0)));
+        assert(big_clip->parent() == nullptr);
+        assertEqual(track->duration(), duration);
+    });
+
+    // Boundary editing next to a transition stays compatible with the
+    // remove_transitions option: refusing removal reports
+    // CANNOT_TRIM_TRANSITION and leaves the track untouched, while allowing
+    // removal deletes the transition and slices the clip normally.
+    tests.add_test(
+        "test_edit_slice_inside_transition_boundary",
+        [] {
+            auto build_track = [](SerializableObject::Retainer<Track>& track,
+                                  SerializableObject::Retainer<Transition>& trx,
+                                  SerializableObject::Retainer<Clip>& clip_0) {
+                clip_0 = new Clip(
+                    "clip_0",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(24.0, 24.0)));
+                trx = new Transition(
+                    "transition_0",
+                    Transition::Type::SMPTE_Dissolve,
+                    RationalTime(5.0, 24.0),
+                    RationalTime(3.0, 24.0));
+                SerializableObject::Retainer<Clip> clip_1 = new Clip(
+                    "clip_1",
+                    nullptr,
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(24.0, 24.0)));
+                track = new Track();
+                track->append_child(clip_0);
+                track->append_child(trx);
+                track->append_child(clip_1);
+            };
+
+            // remove_transitions == false: explicit error, no mutation.
+            {
+                SerializableObject::Retainer<Track>      track;
+                SerializableObject::Retainer<Transition> trx;
+                SerializableObject::Retainer<Clip>       clip_0;
+                build_track(track, trx, clip_0);
+
+                const TimeRange trx_range =
+                    track->trimmed_range_of_child(trx).value();
+                const RationalTime duration = track->duration();
+                const size_t       child_count = track->children().size();
+
+                OTIO_NS::ErrorStatus error_status;
+                algo::slice(
+                    track,
+                    trx_range.start_time() + RationalTime(1.0, 24.0),
+                    false,
+                    &error_status);
+
+                assert(is_error(error_status));
+                assert(
+                    error_status.outcome
+                    == OTIO_NS::ErrorStatus::CANNOT_TRIM_TRANSITION);
+                assertEqual(track->children().size(), child_count);
+                assert(trx->parent() == track.value);
+                assertEqual(
+                    clip_0->trimmed_range(),
+                    TimeRange(
+                        RationalTime(0.0, 24.0),
+                        RationalTime(24.0, 24.0)));
+                assertEqual(track->duration(), duration);
+            }
+
+            // remove_transitions == true: transition removed, slice proceeds.
+            {
+                SerializableObject::Retainer<Track>      track;
+                SerializableObject::Retainer<Transition> trx;
+                SerializableObject::Retainer<Clip>       clip_0;
+                build_track(track, trx, clip_0);
+
+                const TimeRange trx_range =
+                    track->trimmed_range_of_child(trx).value();
+
+                OTIO_NS::ErrorStatus error_status;
+                algo::slice(
+                    track,
+                    trx_range.start_time() + RationalTime(1.0, 24.0),
+                    true,
+                    &error_status);
+
+                assert(!is_error(error_status));
+                size_t transition_count = 0;
+                for (const auto& child: track->children())
+                {
+                    if (dynamic_retainer_cast<Transition>(child))
+                        ++transition_count;
+                }
+                assertEqual(transition_count, static_cast<size_t>(0));
+                assert(trx->parent() == nullptr);
+                // The transition spanned [19,27); slicing at 20 removes it
+                // and splits clip_0 at 20.  Total duration is unchanged.
+                assertEqual(track->children().size(), 3);
+                assertEqual(track->duration(), RationalTime(48.0, 24.0));
+                assert_track_ranges(
+                    track,
+                    { TimeRange(
+                          RationalTime(0.0, 24.0), RationalTime(20.0, 24.0)),
+                      TimeRange(
+                          RationalTime(20.0, 24.0), RationalTime(4.0, 24.0)),
+                      TimeRange(
+                          RationalTime(24.0, 24.0), RationalTime(24.0, 24.0)) });
+            }
+        });
+
     tests.run(argc, argv);
     return 0;
 }
